@@ -1,4 +1,4 @@
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 // Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
@@ -7,7 +7,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     let command = &args[3];
     let command_args = &args[4..];
-    let output = std::process::Command::new(command)
+    let output = Command::new(command)
         .args(command_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -25,7 +25,7 @@ fn main() -> Result<()> {
         print!("{}", std_out);
         eprint!("{}", std_err);
     } else {
-        std::process::exit(1);
+        std::process::exit(output.status.code().unwrap());
     }
 
     Ok(())
