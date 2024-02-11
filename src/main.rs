@@ -1,32 +1,26 @@
-use std::process::{Command, Stdio};
-use anyhow::{Context, Result};
+mod sandbox;
+mod fs;
+
+use anyhow::Result;
+use nix::sys::wait::waitpid;
+use crate::sandbox::Sandbox;
 
 // Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
 fn main() -> Result<()> {
-    // Uncomment this block to pass the first stage!
     let args: Vec<_> = std::env::args().collect();
     let command = &args[3];
     let command_args = &args[4..];
-    let output = Command::new(command)
-        .args(command_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| {
-            format!(
-                "Tried to run '{}' with arguments {:?}",
-                command, command_args
-            )
-        })?;
+    match Sandbox::run(command, command_args) {
+        Ok(sandbox) => {
+            let output = sandbox.consume_output();
+            waitpid(sandbox.child_pid, None).expect("Failed to wait for child process");
 
-    if output.status.success() {
-        let std_out = std::str::from_utf8(&output.stdout)?;
-        let std_err = std::str::from_utf8(&output.stderr)?;
-        print!("{}", std_out);
-        eprint!("{}", std_err);
-    } else {
-        std::process::exit(output.status.code().unwrap());
+            std::process::exit(output.status);
+        }
+
+        Err(e) => {
+            eprintln!("Failed to run Sandbox - {:?}", e);
+            std::process::exit(-1);
+        }
     }
-
-    Ok(())
 }
