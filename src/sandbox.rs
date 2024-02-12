@@ -42,7 +42,9 @@ impl Sandbox {
                 ForkResult::Child => {
                     close(r_pipe).expect("Failed to close read pipe in child");
 
-                    unshare(CloneFlags::CLONE_NEWNS).expect("Failed to unshare mount namespace");
+                    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+                        .expect("Failed to unshare mount and pid namespaces");
+                    
                     pivot_root(new_root.path(), &new_root.path().join(OLD_ROOT))?;
                     chdir("/")?;
 
