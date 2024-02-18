@@ -1,18 +1,19 @@
 use std::fs;
-use std::fs::copy;
+use std::fs::File;
 use std::os::fd::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use nix::mount::{MntFlags, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
-use nix::unistd::{chdir, close, fork, ForkResult, Pid, pivot_root, read, write};
+use nix::unistd::{close, fork, ForkResult, Pid, pivot_root, read, write};
 use serde::{Deserialize, Serialize};
 use tempfile::{tempdir, TempDir};
 use crate::fs::bind_mount;
+use crate::images::DockerRegistryClient;
 
-static OLD_ROOT: &str = "old_root";
+const OLD_ROOT: &str = "old_root";
 
 pub struct Sandbox {
     #[allow(unused)]
@@ -28,9 +29,19 @@ pub struct ChildStatus {
 }
 
 impl Sandbox {
-    pub fn run(command: &String, args: &[String]) -> Result<Sandbox> {
+    pub async fn run(image: &str, command: &str, args: &[String]) -> Result<Sandbox> {
         let (r_pipe, w_pipe) = nix::unistd::pipe().expect("Failed to create pipe");
-        let StartupParams { new_root, rooted_command } = init_sandbox_root(command)?;
+        let (image_name, image_tag) = {
+            let image_tag: Vec<_> = image.split(':').collect();
+            let name = image_tag[0];
+            let tag = match image_tag.get(1) {
+                Some(tag) => *tag,
+                _ => "latest"
+            };
+            (name, tag)
+        };
+
+        let StartupParams { new_root} = init_sandbox_root(image_name, image_tag).await?;
 
         let child_pid: Pid = unsafe {
             match fork()? {
@@ -46,9 +57,12 @@ impl Sandbox {
                         .expect("Failed to unshare mount and pid namespaces");
                     
                     pivot_root(new_root.path(), &new_root.path().join(OLD_ROOT))?;
-                    chdir("/")?;
+                    let old_root = PathBuf::from("/").join(OLD_ROOT);
+                    _ = umount2(old_root.as_path(), MntFlags::MNT_DETACH);
+                    fs::remove_dir_all(old_root.as_path()).expect("Failed to remove old root dir");
+                    std::env::set_current_dir("/").expect("Failed to set current dir");
 
-                    let output = Command::new(rooted_command)
+                    let output = Command::new(command)
                         .args(args)
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
@@ -96,35 +110,65 @@ impl Sandbox {
 
 struct StartupParams {
     new_root: TempDir,
-    rooted_command: String,
 }
 
-fn init_sandbox_root(command: &String) -> Result<StartupParams> {
+async fn init_sandbox_root(image_name: &str, image_tag: &str) -> Result<StartupParams> {
     let new_root = tempdir().expect("Failed to create new tmp root dir");
     let new_root_path = new_root.path();
     bind_mount(new_root_path)?;
 
     create_dev_null(new_root_path);
 
-    let command_path = Path::new(command);
-    let command_filename = command_path.file_name().expect("command is missing filename?");
-    let dest = new_root_path.join(command_filename);
-    copy(command_path, dest).context("Failed to copy to new root")?;
-
-    let rooted_command = Path::new("/").join(command_filename).to_string_lossy().into();
+    fs::create_dir_all(new_root.path().join("tmp/")).expect("Failed to create tmp directory");
 
     {
         let dir = new_root_path.join(OLD_ROOT);
-        _ = umount2(&dir, MntFlags::MNT_DETACH);
+        _ = umount2(&dir, MntFlags::MNT_DETACH); // Just in case
 
         fs::create_dir_all(&dir)
             .context(format!("Failed to create dir '{}'", dir.to_string_lossy()))?;
     }
 
+    let layer_archives = pull_image_layers(image_name, image_tag, "/tmp/").await?;
+    extract_layers(&layer_archives, new_root_path).await?;
+    for archive in &layer_archives {
+        fs::remove_file(archive).expect("Failed to remove layer archive");
+    }
+
     Ok(StartupParams {
         new_root,
-        rooted_command,
     })
+}
+
+async fn pull_image_layers(image_name: &str, image_tag: &str, dest_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let dest_dir = dest_dir.as_ref().to_path_buf();
+
+    //println!("Pulling image {image_name}:{image_tag}");
+
+    let mut layer_archives = Vec::<PathBuf>::new();
+    let mut client = DockerRegistryClient::for_image(image_name, image_tag);
+    let manifest = client.get_manifest().await?;
+    for layer in &manifest.layers {
+        let split_pos = layer.digest.find(':').expect("Can't split digest hash?");
+        let layer_hash = &layer.digest[(split_pos + 1)..];
+        let dest_file = dest_dir.join(layer_hash);
+        client.download_layer(&dest_file, &layer.digest, &layer.media_type).await?;
+        layer_archives.push(dest_file);
+    }
+
+    Ok(layer_archives)
+}
+
+async fn extract_layers(archives: &[PathBuf], dest: impl AsRef<Path>) -> Result<()> {
+    //println!("Extracting layers...");
+    for archive in archives {
+        let tar_gz = File::open(archive)?;
+        let tar = flate2::read::GzDecoder::new(tar_gz);
+        let mut archive = tar::Archive::new(tar);
+        archive.unpack(dest.as_ref())?;
+    }
+
+    Ok(())
 }
 
 fn create_dev_null(root_path: impl AsRef<Path>) {
@@ -138,21 +182,4 @@ fn create_dev_null(root_path: impl AsRef<Path>) {
         Mode::from_bits_truncate(666),
         makedev(1, 3)
     ).expect("Failed to create null device");
-}
-
-#[allow(unused)]
-fn list_dir(dir: impl AsRef<Path>) -> Result<()> {
-    let dir = dir.as_ref();
-    println!("{}", dir.to_string_lossy());
-    let dir = fs::read_dir(dir)?;
-    for e in dir.flatten() {
-        let t = match e.file_type()? {
-            d if d.is_dir() => "Dir",
-            f if f.is_file() => "File",
-            _ => "wat?"
-        };
-        println!("{}: {}", e.path().to_string_lossy(), t);
-    }
-
-    Ok(())
 }

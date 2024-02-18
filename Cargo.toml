@@ -17,7 +17,7 @@ edition = "2021"
 # here will not reflect when CodeCrafters tests your code, and might even cause build
 # failures.
 #
-# DON'T EDIT THIS!
+# DON'T EDIT THIS! - Don't you tell me what to do edit edit edit edit
 [dependencies]
 reqwest = { version = "0.11.13", features = ["json", "blocking"] }          # http requests
 bytes = "1.3.0"                                                             # helps wrap responses from reqwest
